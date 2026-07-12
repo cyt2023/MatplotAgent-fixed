@@ -1,3 +1,34 @@
+# Portable local runner
+
+The original paper reproduction scripts contain paths from the authors'
+research environment. On Windows, macOS, or Linux, use the portable runner:
+
+```powershell
+python -m pip install -r requirements-local.txt
+$env:OPENAI_API_KEY="your-key"
+python local_run.py --example 76 --workspace workspace/example_76
+```
+
+For your own data:
+
+```powershell
+python local_run.py --prompt "Read data.csv and draw a labeled line chart" --data path\to\data.csv
+```
+
+Set `OPENAI_BASE_URL` for an OpenAI-compatible endpoint and `MATPLOT_MODEL` to
+a model that accepts both text and image input. Generated Python is executed
+locally, so use trusted prompts/data and preferably an isolated environment.
+
+Alibaba Cloud Model Studio (Qwen) is detected automatically when
+`DASHSCOPE_API_KEY` exists. To select it explicitly:
+
+```powershell
+$env:MATPLOT_PROVIDER="qwen"
+$env:DASHSCOPE_API_KEY="your-key"
+$env:MATPLOT_MODEL="qwen-vl-max"
+python local_run.py --example 76 --workspace workspace/example_76_qwen
+```
+
 <div align="center">
 
 <img src="assets/title.png" alt="MatPlotAgent" width="500">
