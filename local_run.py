@@ -128,6 +128,92 @@ def static_plot_warnings(code):
             )
     return warnings
 
+def preflight_code_warnings(code, output):
+    """Catch generated scripts that are predictably unsafe before execution."""
+    warnings = []
+    if re.search(r"\.iterrows\s*\(", code):
+        warnings.append(
+            "Do not use DataFrame.iterrows(). The uploaded facet-grid CSV can contain "
+            "millions of rows; reshape it with pandas pivot/pivot_table or NumPy indexing."
+        )
+    if re.search(r"\.itertuples\s*\(", code):
+        warnings.append(
+            "Do not loop over DataFrame.itertuples(). Reshape the complete columns with "
+            "pandas pivot/pivot_table or NumPy indexing."
+        )
+    # Do not reject every ``some_list.index(...)`` call.  The former broad
+    # check also rejected harmless lookups across the three row/column labels
+    # and could prevent an otherwise valid MatPlotAgent figure from running.
+    # Pixel-wise coordinate loops are caught explicitly below; those are the
+    # expensive/unsafe cases this preflight is intended to prevent.
+    if re.search(r"\.index\.map\s*\(", code):
+        warnings.append(
+            "Do not call Index.map() while filling pixels. A pivoted DataFrame is already "
+            "the complete image array; reindex once and use .to_numpy()."
+        )
+    coordinate_loops = re.findall(
+        r"for\s+\w+\s*,\s*\w+\s+in\s+enumerate\s*\(\s*"
+        r"(?:x_indices|y_indices|full_x_range|full_y_range)\s*\)",
+        code,
+    )
+    if coordinate_loops:
+        warnings.append(
+            "Do not loop over x/y coordinate sequences to fill an image. Reindex the "
+            "pivoted DataFrame once and call .to_numpy()."
+        )
+    if re.search(
+        r"for\s+\w+\s+in\s+(?:x_indices|y_indices|full_x|full_y|"
+        r"full_x_range|full_y_range)\s*:",
+        code,
+    ):
+        warnings.append(
+            "Do not loop directly over x/y coordinate sequences to fill an image. "
+            "Reindex the pivoted DataFrame once and call .to_numpy()."
+        )
+    if re.search(
+        r"\[\s*(?:y_indices|y_idx_arr)\s*,\s*"
+        r"(?:x_indices|x_idx_arr)\s*\]\s*=",
+        code,
+    ):
+        warnings.append(
+            "Do not scatter-assign a 2D pivot with two differently sized 1D index "
+            "arrays. Use pivoted.reindex(index=full_y, columns=full_x).to_numpy(dtype=float)."
+        )
+    if re.search(
+        r"(?:full_x|full_y|full_x_indices|full_y_indices)"
+        r"\s*\[\s*(?:x_ticks|y_ticks)\s*\]",
+        code,
+    ) and not re.search(
+        r"np\.asarray\s*\(\s*(?:full_x|full_y|full_x_indices|full_y_indices)\s*\)"
+        r"\s*\[\s*(?:x_ticks|y_ticks)\s*\]",
+        code,
+    ):
+        warnings.append(
+            "Do not index a Python range/list directly with a NumPy tick array. "
+            "Use np.asarray(full_x)[x_ticks] and np.asarray(full_y)[y_ticks]."
+        )
+    if re.search(r"for\s+\w+\s+in\s+\w*(?:pivot|pivoted)\.(?:index|columns)\s*:", code):
+        warnings.append(
+            "Do not loop over pivot index/columns to copy values into another grid. "
+            "Use pivot.reindex(index=..., columns=...).to_numpy() directly."
+        )
+    if re.search(r"len\s*\(\s*[^()\n]+\.shape\s*\[\s*\d+\s*\]\s*\)", code):
+        warnings.append(
+            "Do not call len() on data.shape[n]; shape[n] is already an integer."
+        )
+
+    save_targets = re.findall(
+        r"(?:savefig\s*\(\s*|output_image\s*=\s*)['\"]([^'\"]+\.png)['\"]",
+        code,
+        re.I,
+    )
+    if save_targets and output not in save_targets:
+        warnings.append(
+            f"The script must create {output!r}, but its literal PNG output target(s) are "
+            f"{save_targets!r}. Use the exact requested filename."
+        )
+    return warnings
+
 def inspect_plot(query, image, code, data_context):
     data = base64.b64encode(image.read_bytes()).decode("ascii")
     return complete([{"role": "user", "content": [
@@ -214,12 +300,35 @@ def main():
     query = args.prompt or benchmark_query(args.example, workspace)
     (workspace / "request.txt").write_text(query, encoding="utf-8")
     code = generate(query, workspace, "initial.png")
+    for attempt in range(1, 3):
+        preflight = preflight_code_warnings(code, "initial.png")
+        if not preflight:
+            break
+        (workspace / f"initial_preflight_{attempt}.txt").write_text(
+            "\n".join(f"- {item}" for item in preflight) + "\n",
+            encoding="utf-8",
+        )
+        code = generate(
+            query,
+            workspace,
+            "initial.png",
+            "Mandatory pre-execution corrections:\n"
+            + "\n".join(f"- {item}" for item in preflight),
+            previous_code=code,
+        )
+    remaining_preflight = preflight_code_warnings(code, "initial.png")
+    if remaining_preflight:
+        raise SystemExit(
+            "Generated code failed mandatory pre-execution checks after two revisions:\n"
+            + "\n".join(f"- {item}" for item in remaining_preflight)
+        )
     ok, log = execute(code, workspace, "generated_initial", args.timeout)
     initial = workspace / "initial.png"
-    if not valid_png(initial):
+    if not ok or not valid_png(initial):
         code = generate(query, workspace, "initial.png", "Execution failed, no valid image was created, or the image dimensions were unsafe:\n" + log[-6000:], previous_code=code)
         ok, log = execute(code, workspace, "generated_repair", args.timeout)
-    if not valid_png(initial): raise SystemExit(f"Generation failed; inspect logs in {workspace}")
+    if not ok or not valid_png(initial):
+        raise SystemExit(f"Generation failed; inspect logs in {workspace}")
     final = workspace / args.output
     if args.no_visual_refine: shutil.copy2(initial, final)
     else:
