@@ -21,6 +21,9 @@ JOBS = WORKSPACE / "jobs"
 app = FastAPI(title="MatPlotAgent Local API", version="1.0.0")
 _jobs: dict[str, dict[str, object]] = {}
 _lock = threading.Lock()
+_generation_slots = threading.BoundedSemaphore(
+    max(1, int(os.getenv("MATPLOT_MAX_CONCURRENT", "3")))
+)
 
 
 def _job(job_id: str) -> dict[str, object]:
@@ -58,14 +61,17 @@ def _run(job_id: str, prompt: str, data_path: Path, job_dir: Path) -> None:
         # from the shared scale/cell-order contract.
         if grid_contract.is_file():
             command.append("--no-visual-refine")
-        result = subprocess.run(
-            command,
-            cwd=ROOT,
-            env=os.environ.copy(),
-            capture_output=True,
-            text=True,
-            timeout=420,
-        )
+        _update(job_id, stage="waiting for generation slot", progress=0.08)
+        with _generation_slots:
+            _update(job_id, stage="generating cell panel", progress=0.12)
+            result = subprocess.run(
+                command,
+                cwd=ROOT,
+                env=os.environ.copy(),
+                capture_output=True,
+                text=True,
+                timeout=420,
+            )
         (job_dir / "api_server.log").write_text(
             (result.stdout or "") + (result.stderr or ""),
             encoding="utf-8",

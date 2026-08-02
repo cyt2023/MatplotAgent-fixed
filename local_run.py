@@ -67,7 +67,10 @@ Read files by relative path, use a non-interactive backend, do not invent data
 when input data exists, and save the final figure as {output}. Return only one
 fenced Python code block. Keep figsize at or below 20x20 inches and dpi at or
 below 200. Place annotations inside axes coordinates; do not let artists far
-outside an axis combine with bbox_inches='tight' to create an enormous image."""
+outside an axis combine with bbox_inches='tight' to create an enormous image.
+When creating a dynamic subplot grid, use plt.subplots(..., squeeze=False) and
+index axes[row, column] directly. squeeze=False already returns a two-dimensional
+axes array even for a 1x1 grid; never wrap that result in another np.array."""
     if feedback:
         prompt += f"""
 
@@ -131,6 +134,15 @@ def static_plot_warnings(code):
 def preflight_code_warnings(code, output):
     """Catch generated scripts that are predictably unsafe before execution."""
     warnings = []
+    if re.search(r"plt\.subplots\s*\([^)]*squeeze\s*=\s*False", code, re.S) and re.search(
+        r"axes\s*=\s*np\.array\s*\(\s*\[\s*\[?\s*axes\s*\]?\s*\]\s*\)",
+        code,
+    ):
+        warnings.append(
+            "plt.subplots(..., squeeze=False) already returns a 2D axes array for a "
+            "1x1 grid. Remove the conditional np.array wrapper around axes; it creates "
+            "extra dimensions and makes axes[row, column] a NumPy array instead of an Axes."
+        )
     if re.search(r"\.iterrows\s*\(", code):
         warnings.append(
             "Do not use DataFrame.iterrows(). The uploaded facet-grid CSV can contain "
