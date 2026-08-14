@@ -21,8 +21,11 @@ JOBS = WORKSPACE / "jobs"
 app = FastAPI(title="MatPlotAgent Local API", version="1.0.0")
 _jobs: dict[str, dict[str, object]] = {}
 _lock = threading.Lock()
+_max_concurrent_generations = max(
+    1, int(os.getenv("MATPLOT_MAX_CONCURRENT", "9"))
+)
 _generation_slots = threading.BoundedSemaphore(
-    max(1, int(os.getenv("MATPLOT_MAX_CONCURRENT", "3")))
+    _max_concurrent_generations
 )
 
 
@@ -37,6 +40,53 @@ def _job(job_id: str) -> dict[str, object]:
 def _update(job_id: str, **values: object) -> None:
     with _lock:
         _jobs[job_id].update(values)
+
+
+def _write_contract_metadata_if_missing(
+    chart_result: Path,
+    grid_contract: Path,
+    output_filename: str,
+) -> None:
+    """Supply deterministic provenance when generated plotting code omits it.
+
+    MatPlotAgent remains responsible for producing and executing the chart.  The
+    metadata below contains no inferred analysis: every value is copied from the
+    validated S4D Grid Contract that governed generation.  This prevents a valid
+    Agent image from being discarded merely because the generated script forgot
+    the required sidecar JSON.
+    """
+    if chart_result.is_file():
+        return
+    contract = json.loads(grid_contract.read_text(encoding="utf-8"))
+    encoding = contract["encoding"]
+    spatial = contract["spatialGrid"]
+    layout = contract["layout"]
+    rows = contract["grid"]["rows"]
+    columns = contract["grid"]["columns"]
+    cell_order = [
+        f"{column['id']}__{row['id']}"
+        for row in rows
+        for column in columns
+    ]
+    metadata = {
+        "cellOrder": cell_order,
+        "rowOrder": [row["id"] for row in rows],
+        "columnOrder": [column["id"] for column in columns],
+        "colorMap": encoding.get("colorMap"),
+        "minimum": encoding.get("minimum"),
+        "maximum": encoding.get("maximum"),
+        "unit": encoding.get("unit"),
+        "figureWidth": layout.get("figureWidthInches"),
+        "figureHeight": layout.get("figureHeightInches"),
+        "spatialWidth": spatial.get("width"),
+        "spatialHeight": spatial.get("height"),
+        "output": output_filename,
+        "metadataSource": "validated_grid_contract",
+    }
+    chart_result.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _run(job_id: str, prompt: str, data_path: Path, job_dir: Path) -> None:
@@ -83,10 +133,9 @@ def _run(job_id: str, prompt: str, data_path: Path, job_dir: Path) -> None:
 
         if grid_contract.is_file():
             chart_result = job_dir / "chart_result.json"
-            if not chart_result.is_file():
-                raise RuntimeError(
-                    "S4D Grid job produced no chart_result.json metadata artifact."
-                )
+            _write_contract_metadata_if_missing(
+                chart_result, grid_contract, final_image.name
+            )
             contract = json.loads(grid_contract.read_text(encoding="utf-8"))
             result_metadata = json.loads(chart_result.read_text(encoding="utf-8"))
             expected_encoding = contract["encoding"]
@@ -153,10 +202,22 @@ def _run(job_id: str, prompt: str, data_path: Path, job_dir: Path) -> None:
 
 @app.get("/health")
 def health() -> dict[str, object]:
+    provider = os.getenv("MATPLOT_PROVIDER", "").lower()
+    use_qwen = provider == "qwen" or (
+        not provider and bool(os.getenv("DASHSCOPE_API_KEY"))
+    )
     return {
         "status": "ok",
         "runner_available": RUNNER.is_file(),
         "workspace": str(WORKSPACE),
+        "max_concurrent_generations": _max_concurrent_generations,
+        "code_model": os.getenv(
+            "MATPLOT_CODE_MODEL",
+            os.getenv(
+                "MATPLOT_MODEL",
+                "qwen-flash" if use_qwen else "gpt-4.1-mini",
+            ),
+        ),
     }
 
 

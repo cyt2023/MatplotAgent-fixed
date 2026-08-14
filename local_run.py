@@ -1,7 +1,7 @@
 """Cross-platform local runner for the MatPlotAgent workflow."""
 from __future__ import annotations
 
-import argparse, base64, json, os, re, shutil, subprocess, sys
+import argparse, base64, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 from openai import APIConnectionError, APIStatusError, OpenAI
 from PIL import Image
@@ -23,7 +23,15 @@ def api_client():
 def selected_model():
     provider = os.getenv("MATPLOT_PROVIDER", "").lower()
     use_qwen = provider == "qwen" or (not provider and bool(os.getenv("DASHSCOPE_API_KEY")))
-    return os.getenv("MATPLOT_MODEL", "qwen-vl-max" if use_qwen else "gpt-4.1-mini")
+    # Grid materialization only asks the model to write Python from a text
+    # contract.  It does not send an image when --no-visual-refine is used, so
+    # a large vision model adds latency without improving the input signal.
+    # Keep this separate from MATPLOT_SUMMARY_MODEL, which still receives the
+    # finished grid image in S4DAnalysisService/digest.py.
+    return os.getenv(
+        "MATPLOT_CODE_MODEL",
+        os.getenv("MATPLOT_MODEL", "qwen-flash" if use_qwen else "gpt-4.1-mini"),
+    )
 
 def complete(messages, max_tokens=5000):
     try:
@@ -64,7 +72,9 @@ Working-directory files:
 {listing(workspace) or '- none'}
 
 Read files by relative path, use a non-interactive backend, do not invent data
-when input data exists, and save the final figure as {output}. Return only one
+when input data exists, and save the final figure as {output}. Open every JSON
+or text file explicitly with encoding='utf-8' (the runner may execute on Windows,
+whose default encoding is not UTF-8). Return only one
 fenced Python code block. Keep figsize at or below 20x20 inches and dpi at or
 below 200. Place annotations inside axes coordinates; do not let artists far
 outside an axis combine with bbox_inches='tight' to create an enormous image.
@@ -93,10 +103,11 @@ Review and static-analysis findings:
         {"role": "system", "content": "You are an expert scientific visualization programmer."},
         {"role": "user", "content": prompt}]))
 
-def execute(code, workspace, stem, timeout):
+def execute(code, workspace, stem, timeout, expected_output=""):
     script, log_path = workspace / f"{stem}.py", workspace / f"{stem}.log"
     script.write_text(code, encoding="utf-8")
     env = os.environ.copy(); env.setdefault("MPLBACKEND", "Agg")
+    started_at = time.time()
     try:
         result = subprocess.run([sys.executable, script.name], cwd=workspace, env=env,
                                 capture_output=True, text=True, timeout=timeout)
@@ -104,6 +115,25 @@ def execute(code, workspace, stem, timeout):
     except subprocess.TimeoutExpired as exc:
         log, ok = f"Execution timed out after {timeout}s.\n{exc}", False
     log_path.write_text(log, encoding="utf-8")
+    # Some otherwise valid agent scripts paraphrase the requested output name.
+    # Recover a PNG created by this execution and normalize it to the contract
+    # filename instead of throwing away a completed plot and spending another
+    # model call on a repair that only changes the filename.
+    if ok and expected_output:
+        expected = workspace / expected_output
+        if not valid_png(expected):
+            candidates = sorted(
+                (
+                    path for path in workspace.glob("*.png")
+                    if path != expected
+                    and path.stat().st_mtime >= started_at - 1.0
+                    and valid_png(path)
+                ),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                shutil.copy2(candidates[0], expected)
     return ok, log
 
 def valid_png(path):
@@ -115,6 +145,164 @@ def valid_png(path):
         return True
     except (OSError, SyntaxError, Image.DecompressionBombError):
         return False
+
+def render_contract_fallback(workspace, output):
+    """Render a validated S4D contract after both agent code attempts fail.
+
+    MatPlotAgent remains the primary generator. This bounded renderer prevents a
+    transient code-generation mistake from turning an otherwise valid 3x3 job
+    into nine unavailable panels.
+    """
+    contract_path = workspace / "grid_contract.json"
+    data_path = workspace / "grid_data.csv"
+    if not contract_path.is_file() or not data_path.is_file():
+        return False
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import pandas as pd
+
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        frame = pd.read_csv(data_path, encoding="utf-8")
+        frame = frame.dropna(subset=["value"])
+        columns = contract["grid"]["columns"]
+        rows = contract["grid"]["rows"]
+        encoding = contract["encoding"]
+        layout = contract["layout"]
+        chart_type = contract.get("chartType", "horizontal_heatmap")
+        minimum = float(encoding["minimum"])
+        maximum = float(encoding["maximum"])
+        unit = str(encoding["unit"])
+        cmap = plt.get_cmap(encoding.get("colorMap", "viridis"))
+        figure, axes = plt.subplots(
+            len(rows), len(columns), squeeze=False,
+            figsize=(float(layout["figureWidthInches"]), float(layout["figureHeightInches"])),
+        )
+        last_mappable = None
+        cell_order = []
+        for row_index, row in enumerate(rows):
+            for column_index, column in enumerate(columns):
+                cell_id = f"{column['id']}__{row['id']}"
+                cell_order.append(cell_id)
+                axis = axes[row_index, column_index]
+                cell = frame.loc[frame["cell_id"] == cell_id]
+                values = cell["value"].to_numpy(dtype=float)
+                title = f"{row['label']} x {column['label']}"
+                axis.set_title(title, fontsize=9)
+                if values.size == 0:
+                    axis.text(.5, .5, "No valid values", ha="center", va="center",
+                              transform=axis.transAxes)
+                    axis.set_axis_off()
+                    continue
+                if chart_type in {"bar_chart", "histogram"}:
+                    edges = np.linspace(minimum, maximum, 13)
+                    counts, _ = np.histogram(values, bins=edges)
+                    centers = (edges[:-1] + edges[1:]) / 2
+                    colors = cmap(np.linspace(.2, .85, len(counts)))
+                    axis.bar(centers, counts, width=np.diff(edges) * .88,
+                             color=colors, edgecolor="none")
+                    axis.set_xlim(minimum, maximum)
+                    axis.set_xlabel(unit); axis.set_ylabel("Count")
+                elif chart_type == "scatter_plot":
+                    last_mappable = axis.scatter(
+                        cell["x_index"], cell["y_index"], c=values, cmap=cmap,
+                        vmin=minimum, vmax=maximum, s=1.2, linewidths=0,
+                        rasterized=True,
+                    )
+                    axis.set_aspect("equal", adjustable="box")
+                    axis.set_xlabel("x_index"); axis.set_ylabel("y_index")
+                elif chart_type == "line_chart":
+                    profile = cell.groupby("x_index", sort=True)["value"].mean()
+                    axis.plot(profile.index.to_numpy(), profile.to_numpy(),
+                              color=cmap(.62), linewidth=1.8)
+                    axis.set_ylim(minimum, maximum)
+                    axis.set_xlabel("x_index"); axis.set_ylabel(f"Mean {unit}")
+                elif chart_type == "pie_chart":
+                    counts, edges = np.histogram(
+                        values, bins=np.linspace(minimum, maximum, 7)
+                    )
+                    keep = counts > 0
+                    labels = [
+                        f"[{edges[i]:.2f}, {edges[i + 1]:.2f})"
+                        for i in range(6) if keep[i]
+                    ]
+                    colors = cmap(np.linspace(.05, .95, 6))[keep]
+                    wedges, _, _ = axis.pie(
+                        counts[keep], colors=colors, startangle=90,
+                        autopct=lambda percent: f"{percent:.1f}%" if percent >= 3 else "",
+                        pctdistance=.72, textprops={"fontsize": 8},
+                    )
+                    axis.legend(wedges, labels, loc="center left",
+                                bbox_to_anchor=(1.0, .5), fontsize=7, frameon=False)
+                    axis.set_aspect("equal")
+                elif chart_type == "box_plot":
+                    axis.boxplot(values, orientation="vertical", showfliers=True)
+                    axis.set_ylim(minimum, maximum); axis.set_xticks([1], ["Distribution"])
+                    axis.set_ylabel(unit)
+                elif chart_type == "violin_plot":
+                    axis.violinplot(values, showmeans=True, showmedians=True,
+                                    showextrema=True)
+                    axis.set_ylim(minimum, maximum); axis.set_xticks([1], ["Distribution"])
+                    axis.set_ylabel(unit)
+                else:
+                    width = int(contract["spatialGrid"]["width"])
+                    height = int(contract["spatialGrid"]["height"])
+                    pivot = cell.pivot_table(index="y_index", columns="x_index",
+                                             values="value", aggfunc="mean")
+                    image = pivot.reindex(index=range(height), columns=range(width)).to_numpy(float)
+                    last_mappable = axis.imshow(
+                        image, origin="lower", cmap=cmap, vmin=minimum,
+                        vmax=maximum, interpolation="nearest", aspect="auto",
+                    )
+                    axis.set_xlabel("x_index"); axis.set_ylabel("y_index")
+        if layout.get("showColorbar") and last_mappable is not None:
+            figure.colorbar(last_mappable, ax=axes.ravel().tolist(), label=unit,
+                            fraction=.025, pad=.02)
+        if chart_type == "pie_chart":
+            figure.subplots_adjust(right=.72, wspace=.45, hspace=.5)
+        else:
+            figure.tight_layout()
+        figure.savefig(workspace / output, dpi=150)
+        plt.close(figure)
+        metadata = {
+            "cellOrder": cell_order,
+            "colorMap": encoding.get("colorMap", "viridis"),
+            "minimum": minimum, "maximum": maximum, "unit": unit,
+            "figureWidth": layout["figureWidthInches"],
+            "figureHeight": layout["figureHeightInches"],
+            "spatialWidth": contract["spatialGrid"]["width"],
+            "spatialHeight": contract["spatialGrid"]["height"],
+            "outputFilename": output,
+            "fallbackAfterAgentFailure": True,
+        }
+        (workspace / "chart_result.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (workspace / "contract_fallback.log").write_text(
+            f"Rendered {chart_type} after MatPlotAgent code execution failed.\n",
+            encoding="utf-8",
+        )
+        return valid_png(workspace / output)
+    except Exception as exc:
+        (workspace / "contract_fallback.log").write_text(
+            f"Fallback failed: {type(exc).__name__}: {exc}\n", encoding="utf-8"
+        )
+        return False
+
+def finish_contract_fallback(workspace, output):
+    """Commit a fallback image using the same output contract as the agent."""
+    initial = workspace / "initial.png"
+    if not render_contract_fallback(workspace, initial.name):
+        return False
+    final = workspace / output
+    if final != initial:
+        shutil.copy2(initial, final)
+    print(f"Done with validated contract fallback: {final}")
+    return True
 
 def static_plot_warnings(code):
     warnings = []
@@ -134,14 +322,56 @@ def static_plot_warnings(code):
 def preflight_code_warnings(code, output):
     """Catch generated scripts that are predictably unsafe before execution."""
     warnings = []
-    if re.search(r"plt\.subplots\s*\([^)]*squeeze\s*=\s*False", code, re.S) and re.search(
-        r"axes\s*=\s*np\.array\s*\(\s*\[\s*\[?\s*axes\s*\]?\s*\]\s*\)",
+    for match in re.finditer(
+        r"open\s*\(\s*(['\"])([^'\"]+\.(?:json|txt))\1(?P<args>[^)]*)\)",
+        code,
+        re.I,
+    ):
+        if "encoding" not in match.group("args"):
+            warnings.append(
+                f"Open {match.group(2)!r} explicitly with encoding='utf-8'. "
+                "The script runs on Windows and must not use the GBK default."
+            )
+    if re.search(
+        r"counts\s*,\s*_\s*=\s*pd\.cut\s*\([^\n]+\)\.value_counts\s*\(",
         code,
     ):
+        warnings.append(
+            "pd.cut(...).value_counts() returns one Series, not a (counts, edges) "
+            "tuple. For the required bar distribution use "
+            "counts, _ = np.histogram(values, bins=edges)."
+        )
+    if re.search(
+        r"\.bar\s*\([^\n]*\bcolor\s*=\s*(?:colormap|cmap_name|cmap)\b",
+        code,
+    ):
+        warnings.append(
+            "A colormap name such as 'viridis' is not a Matplotlib bar color. "
+            "Evaluate it first, e.g. bar_colors = plt.get_cmap(colormap)("
+            "np.linspace(0.2, 0.85, len(counts))), then pass color=bar_colors."
+        )
+    redundant_axes_wrapper = re.search(
+        r"axes\s*=\s*np\.array\s*\(\s*\[\s*\[\s*axes\s*\]\s*\]\s*\)",
+        code,
+    )
+    if re.search(r"plt\.subplots[\s\S]{0,300}squeeze\s*=\s*False", code) and \
+            redundant_axes_wrapper:
         warnings.append(
             "plt.subplots(..., squeeze=False) already returns a 2D axes array for a "
             "1x1 grid. Remove the conditional np.array wrapper around axes; it creates "
             "extra dimensions and makes axes[row, column] a NumPy array instead of an Axes."
+        )
+    if re.search(r"(?:fig\.)?suptitle\s*\([^\n]*(?:rawText|rawIntent)", code):
+        warnings.append(
+            "Do not place the full raw user intent in fig.suptitle(). Long prompts "
+            "combined with bbox_inches='tight' create panoramic images and make the "
+            "actual chart tiny. Use a short task label inside the canonical figure."
+        )
+    if re.search(r"(?:plt|fig)\.colorbar\s*\(", code) and "showColorbar" not in code:
+        warnings.append(
+            "Read contract['layout']['showColorbar'] and add a colorbar only when it "
+            "is true. S4D uses one shared scale and deliberately assigns the visible "
+            "colorbar to a bounded subset of cells."
         )
     if re.search(r"\.iterrows\s*\(", code):
         warnings.append(
@@ -305,13 +535,22 @@ def main():
     parser.add_argument("--timeout", type=int, default=120)
     args = parser.parse_args()
     workspace = Path(args.workspace).resolve(); workspace.mkdir(parents=True, exist_ok=True)
-    for raw in args.data:
+    for index, raw in enumerate(args.data):
         path = Path(raw).resolve()
         if not path.is_file(): raise SystemExit(f"Data file does not exist: {path}")
-        shutil.copy2(path, workspace / path.name)
+        # S4D sends one CSV per cell. Give it a stable, semantic name so code
+        # generation never has to copy a UUID from the prompt correctly.
+        target = workspace / ("grid_data.csv" if index == 0 and path.suffix.lower() == ".csv" else path.name)
+        if path != target:
+            shutil.copy2(path, target)
     query = args.prompt or benchmark_query(args.example, workspace)
     (workspace / "request.txt").write_text(query, encoding="utf-8")
-    code = generate(query, workspace, "initial.png")
+    try:
+        code = generate(query, workspace, "initial.png")
+    except SystemExit:
+        if finish_contract_fallback(workspace, args.output):
+            return
+        raise
     for attempt in range(1, 3):
         preflight = preflight_code_warnings(code, "initial.png")
         if not preflight:
@@ -330,17 +569,25 @@ def main():
         )
     remaining_preflight = preflight_code_warnings(code, "initial.png")
     if remaining_preflight:
+        if finish_contract_fallback(workspace, args.output):
+            return
         raise SystemExit(
             "Generated code failed mandatory pre-execution checks after two revisions:\n"
             + "\n".join(f"- {item}" for item in remaining_preflight)
         )
-    ok, log = execute(code, workspace, "generated_initial", args.timeout)
+    ok, log = execute(code, workspace, "generated_initial", args.timeout, "initial.png")
     initial = workspace / "initial.png"
     if not ok or not valid_png(initial):
-        code = generate(query, workspace, "initial.png", "Execution failed, no valid image was created, or the image dimensions were unsafe:\n" + log[-6000:], previous_code=code)
-        ok, log = execute(code, workspace, "generated_repair", args.timeout)
+        try:
+            code = generate(query, workspace, "initial.png", "Execution failed, no valid image was created, or the image dimensions were unsafe:\n" + log[-6000:], previous_code=code)
+            ok, log = execute(code, workspace, "generated_repair", args.timeout, "initial.png")
+        except SystemExit:
+            if finish_contract_fallback(workspace, args.output):
+                return
+            raise
     if not ok or not valid_png(initial):
-        raise SystemExit(f"Generation failed; inspect logs in {workspace}")
+        if not render_contract_fallback(workspace, "initial.png"):
+            raise SystemExit(f"Generation failed; inspect logs in {workspace}")
     final = workspace / args.output
     if args.no_visual_refine: shutil.copy2(initial, final)
     else:
@@ -349,7 +596,7 @@ def main():
         (workspace / "visual_feedback.txt").write_text(feedback, encoding="utf-8")
         candidate = workspace / "refined_candidate.png"
         refined = generate(query, workspace, candidate.name, feedback, previous_code=code)
-        ok, log = execute(refined, workspace, "generated_refined", args.timeout)
+        ok, log = execute(refined, workspace, "generated_refined", args.timeout, candidate.name)
         if not valid_png(candidate):
             shutil.copy2(initial, final)
             (workspace / "refinement_failed.log").write_text(log, encoding="utf-8")
