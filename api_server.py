@@ -42,21 +42,20 @@ def _update(job_id: str, **values: object) -> None:
         _jobs[job_id].update(values)
 
 
-def _write_contract_metadata_if_missing(
+def _write_contract_metadata(
     chart_result: Path,
     grid_contract: Path,
     output_filename: str,
 ) -> None:
-    """Supply deterministic provenance when generated plotting code omits it.
+    """Write deterministic provenance from the validated S4D contract.
 
     MatPlotAgent remains responsible for producing and executing the chart.  The
-    metadata below contains no inferred analysis: every value is copied from the
-    validated S4D Grid Contract that governed generation.  This prevents a valid
-    Agent image from being discarded merely because the generated script forgot
-    the required sidecar JSON.
+    required metadata below contains no inferred analysis: every value is copied
+    from the validated S4D Grid Contract that governed generation.  Generated
+    code may omit a field, use a spelling alias, or accidentally emit an empty
+    unit.  None of those formatting mistakes should discard an otherwise valid
+    image, and generated code must never be authoritative for data provenance.
     """
-    if chart_result.is_file():
-        return
     contract = json.loads(grid_contract.read_text(encoding="utf-8"))
     encoding = contract["encoding"]
     spatial = contract["spatialGrid"]
@@ -68,7 +67,16 @@ def _write_contract_metadata_if_missing(
         for row in rows
         for column in columns
     ]
-    metadata = {
+    metadata: dict[str, object] = {}
+    if chart_result.is_file():
+        try:
+            loaded = json.loads(chart_result.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                metadata.update(loaded)
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Canonical fields always win over model-authored values.
+    metadata.update({
         "cellOrder": cell_order,
         "rowOrder": [row["id"] for row in rows],
         "columnOrder": [column["id"] for column in columns],
@@ -82,7 +90,10 @@ def _write_contract_metadata_if_missing(
         "spatialHeight": spatial.get("height"),
         "output": output_filename,
         "metadataSource": "validated_grid_contract",
-    }
+    })
+    # Remove known aliases so downstream clients see one stable schema.
+    for alias in ("usedCellOrder", "colormap", "outputFilename"):
+        metadata.pop(alias, None)
     chart_result.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -133,7 +144,7 @@ def _run(job_id: str, prompt: str, data_path: Path, job_dir: Path) -> None:
 
         if grid_contract.is_file():
             chart_result = job_dir / "chart_result.json"
-            _write_contract_metadata_if_missing(
+            _write_contract_metadata(
                 chart_result, grid_contract, final_image.name
             )
             contract = json.loads(grid_contract.read_text(encoding="utf-8"))
@@ -209,7 +220,13 @@ def health() -> dict[str, object]:
     return {
         "status": "ok",
         "runner_available": RUNNER.is_file(),
+        "workspaceRoot": str(ROOT),
         "workspace": str(WORKSPACE),
+        "provider": "qwen" if use_qwen else "openai",
+        "providerConfigured": bool(
+            os.getenv("DASHSCOPE_API_KEY") if use_qwen
+            else os.getenv("OPENAI_API_KEY")
+        ),
         "max_concurrent_generations": _max_concurrent_generations,
         "code_model": os.getenv(
             "MATPLOT_CODE_MODEL",

@@ -8,6 +8,10 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
 BENCHMARK = ROOT / "benchmark_data"
+BUNDLED_UI_FONT = (
+    ROOT.parent.parent / "RenderingModule" / "Assets" / "Resources" /
+    "Fonts" / "Poppins-Bold.ttf"
+)
 
 def api_client():
     provider = os.getenv("MATPLOT_PROVIDER", "").lower()
@@ -76,7 +80,11 @@ when input data exists, and save the final figure as {output}. Open every JSON
 or text file explicitly with encoding='utf-8' (the runner may execute on Windows,
 whose default encoding is not UTF-8). Return only one
 fenced Python code block. Keep figsize at or below 20x20 inches and dpi at or
-below 200. Place annotations inside axes coordinates; do not let artists far
+below 200. Render at 200 dpi. Use a consistent readable type scale: subplot
+titles at least 14 pt, axis labels at least 13 pt, tick labels at least 11 pt,
+and legends/colorbars at least 11 pt. When Poppins-Bold.ttf is present, register
+it with `matplotlib.font_manager.fontManager.addfont` and use its resolved family
+name for all chart text. Place annotations inside axes coordinates; do not let artists far
 outside an axis combine with bbox_inches='tight' to create an enormous image.
 When creating a dynamic subplot grid, use plt.subplots(..., squeeze=False) and
 index axes[row, column] directly. squeeze=False already returns a two-dimensional
@@ -162,8 +170,25 @@ def render_contract_fallback(workspace, output):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from matplotlib import font_manager
         import numpy as np
         import pandas as pd
+
+        bundled_font = workspace / "Poppins-Bold.ttf"
+        font_family = "DejaVu Sans"
+        if bundled_font.is_file():
+            font_manager.fontManager.addfont(str(bundled_font))
+            font_family = font_manager.FontProperties(
+                fname=str(bundled_font)).get_name()
+        plt.rcParams.update({
+            "font.family": font_family,
+            "font.size": 12,
+            "axes.titlesize": 14,
+            "axes.labelsize": 13,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "legend.fontsize": 11,
+        })
 
         contract = json.loads(contract_path.read_text(encoding="utf-8"))
         frame = pd.read_csv(data_path, encoding="utf-8")
@@ -191,7 +216,7 @@ def render_contract_fallback(workspace, output):
                 cell = frame.loc[frame["cell_id"] == cell_id]
                 values = cell["value"].to_numpy(dtype=float)
                 title = f"{row['label']} x {column['label']}"
-                axis.set_title(title, fontsize=9)
+                axis.set_title(title, fontsize=14, fontweight="semibold")
                 if values.size == 0:
                     axis.text(.5, .5, "No valid values", ha="center", va="center",
                               transform=axis.transAxes)
@@ -233,10 +258,10 @@ def render_contract_fallback(workspace, output):
                     wedges, _, _ = axis.pie(
                         counts[keep], colors=colors, startangle=90,
                         autopct=lambda percent: f"{percent:.1f}%" if percent >= 3 else "",
-                        pctdistance=.72, textprops={"fontsize": 8},
+                        pctdistance=.72, textprops={"fontsize": 11},
                     )
                     axis.legend(wedges, labels, loc="center left",
-                                bbox_to_anchor=(1.0, .5), fontsize=7, frameon=False)
+                                bbox_to_anchor=(1.0, .5), fontsize=11, frameon=False)
                     axis.set_aspect("equal")
                 elif chart_type == "box_plot":
                     axis.boxplot(values, orientation="vertical", showfliers=True)
@@ -248,24 +273,57 @@ def render_contract_fallback(workspace, output):
                     axis.set_ylim(minimum, maximum); axis.set_xticks([1], ["Distribution"])
                     axis.set_ylabel(unit)
                 else:
-                    width = int(contract["spatialGrid"]["width"])
-                    height = int(contract["spatialGrid"]["height"])
+                    spatial = contract["spatialGrid"]
+                    width = int(spatial["width"])
+                    height = int(spatial["height"])
                     pivot = cell.pivot_table(index="y_index", columns="x_index",
                                              values="value", aggfunc="mean")
                     image = pivot.reindex(index=range(height), columns=range(width)).to_numpy(float)
-                    last_mappable = axis.imshow(
-                        image, origin="lower", cmap=cmap, vmin=minimum,
-                        vmax=maximum, interpolation="nearest", aspect="auto",
-                    )
-                    axis.set_xlabel("x_index"); axis.set_ylabel("y_index")
+                    georef = spatial.get("georeference")
+                    if georef:
+                        x_axis = georef["x"]
+                        y_axis = georef["y"]
+                        extent = [
+                            float(x_axis["minimum"]) - float(x_axis["step"]) / 2,
+                            float(x_axis["maximum"]) + float(x_axis["step"]) / 2,
+                            float(y_axis["minimum"]) - float(y_axis["step"]) / 2,
+                            float(y_axis["maximum"]) + float(y_axis["step"]) / 2,
+                        ]
+                        last_mappable = axis.imshow(
+                            image, origin="lower", extent=extent, cmap=cmap,
+                            vmin=minimum, vmax=maximum,
+                            interpolation="nearest", aspect="auto",
+                        )
+                        axis.set_xlabel(
+                            "Longitude (degrees east) | "
+                            f"CRS: {georef['coordinateReference']}"
+                        )
+                        axis.set_ylabel("Latitude (degrees north)")
+                        axis.set_xticks(np.linspace(
+                            float(x_axis["minimum"]), float(x_axis["maximum"]),
+                            min(width, 6),
+                        ))
+                        axis.set_yticks(np.linspace(
+                            float(y_axis["minimum"]), float(y_axis["maximum"]),
+                            min(height, 6),
+                        ))
+                    else:
+                        last_mappable = axis.imshow(
+                            image, origin="lower", cmap=cmap, vmin=minimum,
+                            vmax=maximum, interpolation="nearest", aspect="auto",
+                        )
+                        axis.set_xlabel("x_index"); axis.set_ylabel("y_index")
         if layout.get("showColorbar") and last_mappable is not None:
-            figure.colorbar(last_mappable, ax=axes.ravel().tolist(), label=unit,
-                            fraction=.025, pad=.02)
+            colorbar = figure.colorbar(
+                last_mappable, ax=axes.ravel().tolist(), label=unit,
+                fraction=.025, pad=.02)
+            colorbar.ax.tick_params(labelsize=11)
+            colorbar.set_label(unit, size=13)
         if chart_type == "pie_chart":
             figure.subplots_adjust(right=.72, wspace=.45, hspace=.5)
         else:
             figure.tight_layout()
-        figure.savefig(workspace / output, dpi=150)
+        figure.savefig(workspace / output, dpi=200)
         plt.close(figure)
         metadata = {
             "cellOrder": cell_order,
@@ -535,6 +593,8 @@ def main():
     parser.add_argument("--timeout", type=int, default=120)
     args = parser.parse_args()
     workspace = Path(args.workspace).resolve(); workspace.mkdir(parents=True, exist_ok=True)
+    if BUNDLED_UI_FONT.is_file():
+        shutil.copy2(BUNDLED_UI_FONT, workspace / "Poppins-Bold.ttf")
     for index, raw in enumerate(args.data):
         path = Path(raw).resolve()
         if not path.is_file(): raise SystemExit(f"Data file does not exist: {path}")
