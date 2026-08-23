@@ -1,7 +1,7 @@
 """Cross-platform local runner for the MatPlotAgent workflow."""
 from __future__ import annotations
 
-import argparse, base64, json, os, re, shutil, subprocess, sys, time
+import argparse, base64, csv, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 from openai import APIConnectionError, APIStatusError, OpenAI
 from PIL import Image
@@ -153,6 +153,60 @@ def valid_png(path):
         return True
     except (OSError, SyntaxError, Image.DecompressionBombError):
         return False
+
+def contract_execution_warnings(workspace):
+    """Verify that generated code actually consumed every contracted cell.
+
+    A syntactically valid Matplotlib script can silently filter the CSV with a
+    misspelled cell_id and still produce a valid-looking, completely empty PNG.
+    The generated chart_result is retained until this check runs, so its
+    usedCellOrder is evidence of which cells the agent attempted to render.
+    """
+    contract_path = workspace / "grid_contract.json"
+    data_path = workspace / "grid_data.csv"
+    result_path = workspace / "chart_result.json"
+    if not contract_path.is_file():
+        return []
+    warnings = []
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        expected = contract.get("expectedCellOrder") or [
+            f"{column['id']}__{row['id']}"
+            for row in contract["grid"]["rows"]
+            for column in contract["grid"]["columns"]
+        ]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        return [f"Cannot validate the grid contract: {type(exc).__name__}: {exc}"]
+
+    available = set()
+    try:
+        with data_path.open("r", encoding="utf-8", newline="") as stream:
+            for row in csv.DictReader(stream):
+                cell_id = row.get("cell_id")
+                value = row.get("value")
+                if cell_id and value not in (None, "", "nan", "NaN"):
+                    available.add(cell_id)
+    except (OSError, csv.Error) as exc:
+        warnings.append(
+            f"Cannot validate grid_data.csv: {type(exc).__name__}: {exc}"
+        )
+    missing_data = [cell_id for cell_id in expected if cell_id not in available]
+    if missing_data:
+        warnings.append(
+            "Contracted cells have no valid CSV rows: " + ", ".join(missing_data)
+        )
+
+    try:
+        metadata = json.loads(result_path.read_text(encoding="utf-8"))
+        used = metadata.get("usedCellOrder", metadata.get("cellOrder"))
+    except (OSError, json.JSONDecodeError):
+        used = None
+    if used != expected:
+        warnings.append(
+            f"Generated chart used cell order {used!r}; expected {expected!r}. "
+            "This usually means generated code filtered cell_id incorrectly."
+        )
+    return warnings
 
 def render_contract_fallback(workspace, output):
     """Render a validated S4D contract after both agent code attempts fail.
@@ -648,6 +702,18 @@ def main():
     if not ok or not valid_png(initial):
         if not render_contract_fallback(workspace, "initial.png"):
             raise SystemExit(f"Generation failed; inspect logs in {workspace}")
+    semantic_warnings = contract_execution_warnings(workspace)
+    if semantic_warnings:
+        (workspace / "contract_execution_validation.log").write_text(
+            "\n".join(f"- {item}" for item in semantic_warnings) + "\n",
+            encoding="utf-8",
+        )
+        if finish_contract_fallback(workspace, args.output):
+            return
+        raise SystemExit(
+            "Generated chart failed contract execution validation:\n" +
+            "\n".join(f"- {item}" for item in semantic_warnings)
+        )
     final = workspace / args.output
     if args.no_visual_refine: shutil.copy2(initial, final)
     else:
