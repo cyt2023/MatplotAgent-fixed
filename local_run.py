@@ -318,7 +318,10 @@ def render_contract_fallback(workspace, output):
                                 bbox_to_anchor=(1.0, .5), fontsize=11, frameon=False)
                     axis.set_aspect("equal")
                 elif chart_type == "box_plot":
-                    axis.boxplot(values, orientation="vertical", showfliers=True)
+                    # "orientation" is only available in newer Matplotlib
+                    # releases. "vert" keeps the packaged fallback compatible
+                    # with the 3.8+ range supported by this project.
+                    axis.boxplot(values, vert=True, showfliers=True)
                     axis.set_ylim(minimum, maximum); axis.set_xticks([1], ["Distribution"])
                     axis.set_ylabel(unit)
                 elif chart_type == "violin_plot":
