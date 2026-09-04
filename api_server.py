@@ -8,6 +8,7 @@ import sys
 import threading
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -242,7 +243,7 @@ def health() -> dict[str, object]:
 async def create_job(
     prompt: str = Form(...),
     data: UploadFile = File(...),
-    contract: UploadFile | None = File(None),
+    contract: Optional[UploadFile] = File(None),
 ) -> dict[str, str]:
     if not RUNNER.is_file():
         raise HTTPException(status_code=503, detail=f"Missing runner: {RUNNER}")
