@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -28,6 +29,27 @@ _max_concurrent_generations = max(
 _generation_slots = threading.BoundedSemaphore(
     _max_concurrent_generations
 )
+
+_max_pending_jobs = max(_max_concurrent_generations, int(os.getenv("MATPLOT_MAX_PENDING", "81")))
+_admission_slots = threading.BoundedSemaphore(_max_pending_jobs)
+_max_upload_bytes = 64 * 1024 * 1024
+
+
+async def _save_upload(upload: UploadFile, destination: Path, limit: int) -> None:
+    size = 0
+    with destination.open("wb") as stream:
+        while chunk := await upload.read(1024 * 1024):
+            size += len(chunk)
+            if size > limit:
+                raise HTTPException(status_code=413, detail="Upload exceeds size limit")
+            stream.write(chunk)
+
+
+def _run_admitted(*args) -> None:
+    try:
+        _run(*args)
+    finally:
+        _admission_slots.release()
 
 
 def _job(job_id: str) -> dict[str, object]:
@@ -229,6 +251,8 @@ def health() -> dict[str, object]:
             else os.getenv("OPENAI_API_KEY")
         ),
         "max_concurrent_generations": _max_concurrent_generations,
+        "max_pending_jobs": _max_pending_jobs,
+        "max_upload_bytes": _max_upload_bytes,
         "code_model": os.getenv(
             "MATPLOT_CODE_MODEL",
             os.getenv(
@@ -250,40 +274,50 @@ async def create_job(
     if not prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt is required")
 
+    if not _admission_slots.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="Chart queue is full; retry after current charts finish", headers={"Retry-After": "5"})
     job_id = uuid.uuid4().hex
     suffix = Path(data.filename or "data.csv").suffix or ".csv"
     upload_path = UPLOADS / f"{job_id}{suffix}"
     job_dir = JOBS / job_id
-    UPLOADS.mkdir(parents=True, exist_ok=True)
-    job_dir.mkdir(parents=True, exist_ok=False)
-    upload_path.write_bytes(await data.read())
-    if contract is not None:
-        contract_path = job_dir / "grid_contract.json"
-        contract_path.write_bytes(await contract.read())
-        try:
-            json.loads(contract_path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid Grid contract JSON") from exc
+    try:
+        UPLOADS.mkdir(parents=True, exist_ok=True)
+        job_dir.mkdir(parents=True, exist_ok=False)
+        await _save_upload(data, upload_path, _max_upload_bytes)
+        if contract is not None:
+            contract_path = job_dir / "grid_contract.json"
+            await _save_upload(contract, contract_path, 2 * 1024 * 1024)
+            try:
+                json.loads(contract_path.read_text(encoding="utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid Grid contract JSON") from exc
 
-    with _lock:
-        _jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "stage": "queued",
-            "progress": 0.04,
-            "comparison_status": "",
-            "review_skipped": False,
-            "rollback_used": False,
-            "error": "",
-            "image_url": "",
-            "code_url": "",
-            "log_url": "",
-        }
-    threading.Thread(
-        target=_run,
-        args=(job_id, prompt.strip(), upload_path, job_dir),
-        daemon=True,
-    ).start()
+        with _lock:
+            _jobs[job_id] = {
+                "job_id": job_id,
+                "status": "queued",
+                "stage": "queued",
+                "progress": 0.04,
+                "comparison_status": "",
+                "review_skipped": False,
+                "rollback_used": False,
+                "error": "",
+                "image_url": "",
+                "code_url": "",
+                "log_url": "",
+            }
+        threading.Thread(
+            target=_run_admitted,
+            args=(job_id, prompt.strip(), upload_path, job_dir),
+            daemon=True,
+        ).start()
+    except BaseException:
+        _admission_slots.release()
+        with _lock:
+            _jobs.pop(job_id, None)
+        upload_path.unlink(missing_ok=True)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
     return {
         "job_id": job_id,
         "status": "queued",
